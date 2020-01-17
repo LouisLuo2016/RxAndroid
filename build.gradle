@@ -1,23 +1,27 @@
 subprojects {
     buildscript {
         repositories {
+            google()
             mavenCentral()
             jcenter()
         }
         dependencies {
-            classpath 'com.android.tools.build:gradle:2.1.0'
+            classpath 'com.android.tools.build:gradle:3.4.1'
+            classpath 'com.github.dcendents:android-maven-gradle-plugin:2.1'
+            classpath 'com.jfrog.bintray.gradle:gradle-bintray-plugin:1.8.4'
+            classpath 'org.jfrog.buildinfo:build-info-extractor-gradle:4.7.5'
         }
     }
 
     repositories {
-        maven { url 'https://oss.jfrog.org/libs-snapshot/' }
+        google()
         mavenCentral()
+        jcenter()
     }
 }
 
 ext {
     minSdkVersion = 9
-    compileSdkVersion = 24
-    buildToolsVersion = '24.0.1'
+    compileSdkVersion = 28
     sourceCompatibility = JavaVersion.VERSION_1_7
 }

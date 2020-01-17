@@ -15,13 +15,16 @@ package io.reactivex.android.schedulers;
 
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Message;
 import io.reactivex.Scheduler;
 import io.reactivex.Scheduler.Worker;
 import io.reactivex.android.testutil.CountingRunnable;
 import io.reactivex.disposables.Disposable;
+import io.reactivex.functions.Consumer;
 import io.reactivex.functions.Function;
 import io.reactivex.plugins.RxJavaPlugins;
-import java.lang.Thread.UncaughtExceptionHandler;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.After;
@@ -29,9 +32,10 @@ import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.robolectric.RobolectricTestRunner;
+import org.robolectric.ParameterizedRobolectricTestRunner;
 import org.robolectric.annotation.Config;
 import org.robolectric.shadows.ShadowLooper;
+import org.robolectric.shadows.ShadowMessageQueue;
 
 import static java.util.concurrent.TimeUnit.MINUTES;
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -41,14 +45,32 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import static org.robolectric.Shadows.shadowOf;
 import static org.robolectric.shadows.ShadowLooper.pauseMainLooper;
 import static org.robolectric.shadows.ShadowLooper.runUiThreadTasks;
 import static org.robolectric.shadows.ShadowLooper.runUiThreadTasksIncludingDelayedTasks;
 import static org.robolectric.shadows.ShadowLooper.unPauseMainLooper;
 
-@RunWith(RobolectricTestRunner.class)
-@Config(manifest=Config.NONE)
+@RunWith(ParameterizedRobolectricTestRunner.class)
+@Config(manifest=Config.NONE, sdk = 16)
 public final class HandlerSchedulerTest {
+
+    @ParameterizedRobolectricTestRunner.Parameters(name = "async = {0}")
+    public static Collection<Object[]> data() {
+        return Arrays.asList(new Object[][]{
+            {true},
+            {false}
+        });
+    }
+
+    private Scheduler scheduler;
+    private boolean async;
+
+    public HandlerSchedulerTest(boolean async) {
+        this.scheduler = new HandlerScheduler(new Handler(Looper.getMainLooper()), async);
+        this.async = async;
+    }
+
     @Before
     public void setUp() {
         RxJavaPlugins.reset();
@@ -61,12 +83,19 @@ public final class HandlerSchedulerTest {
         unPauseMainLooper();
     }
 
-    private Scheduler scheduler = new HandlerScheduler(new Handler(Looper.getMainLooper()));
-
     @Test
     public void directScheduleOncePostsImmediately() {
         CountingRunnable counter = new CountingRunnable();
         scheduler.scheduleDirect(counter);
+
+        runUiThreadTasks();
+        assertEquals(1, counter.get());
+    }
+
+    @Test
+    public void directScheduleOnceWithNegativeDelayPostsImmediately() {
+        CountingRunnable counter = new CountingRunnable();
+        scheduler.scheduleDirect(counter, -1, TimeUnit.MINUTES);
 
         runUiThreadTasks();
         assertEquals(1, counter.get());
@@ -295,6 +324,17 @@ public final class HandlerSchedulerTest {
 
         CountingRunnable counter = new CountingRunnable();
         worker.schedule(counter);
+
+        runUiThreadTasks();
+        assertEquals(1, counter.get());
+    }
+
+    @Test
+    public void workerScheduleOnceWithNegativeDelayPostsImmediately() {
+        Worker worker = scheduler.createWorker();
+
+        CountingRunnable counter = new CountingRunnable();
+        worker.schedule(counter, -1, TimeUnit.MINUTES);
 
         runUiThreadTasks();
         assertEquals(1, counter.get());
@@ -618,37 +658,35 @@ public final class HandlerSchedulerTest {
         assertTrue(disposable.isDisposed());
     }
 
-    @Test public void throwingActionRoutedToHookAndThreadHandler() {
-        // TODO Test hook as well. Requires https://github.com/ReactiveX/RxJava/pull/3820.
+    @Test
+    public void throwingActionRoutedToRxJavaPlugins() {
+        Consumer<? super Throwable> originalErrorHandler = RxJavaPlugins.getErrorHandler();
 
-        Thread thread = Thread.currentThread();
-        UncaughtExceptionHandler originalHandler = thread.getUncaughtExceptionHandler();
+        try {
+            final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
+            RxJavaPlugins.setErrorHandler(new Consumer<Throwable>() {
+                @Override
+                public void accept(Throwable throwable) throws Exception {
+                    throwableRef.set(throwable);
+                }
+            });
 
-        final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
-        thread.setUncaughtExceptionHandler(new UncaughtExceptionHandler() {
-            @Override public void uncaughtException(Thread thread, Throwable ex) {
-                throwableRef.set(ex);
-            }
-        });
+            Worker worker = scheduler.createWorker();
 
-        Worker worker = scheduler.createWorker();
+            final NullPointerException npe = new NullPointerException();
+            Runnable action = new Runnable() {
+                @Override
+                public void run() {
+                    throw npe;
+                }
+            };
+            worker.schedule(action);
 
-        final NullPointerException npe = new NullPointerException();
-        Runnable action = new Runnable() {
-            @Override public void run() {
-                throw npe;
-            }
-        };
-        worker.schedule(action);
-
-        runUiThreadTasks();
-        Throwable throwable = throwableRef.get();
-        assertTrue(throwable instanceof IllegalStateException);
-        assertEquals("Fatal Exception thrown on Scheduler.", throwable.getMessage());
-        assertSame(npe, throwable.getCause());
-
-        // Restore the original uncaught exception handler.
-        thread.setUncaughtExceptionHandler(originalHandler);
+            runUiThreadTasks();
+            assertSame(npe, throwableRef.get());
+        } finally {
+            RxJavaPlugins.setErrorHandler(originalErrorHandler);
+        }
     }
 
     @Test
@@ -666,12 +704,6 @@ public final class HandlerSchedulerTest {
             assertEquals("run == null", e.getMessage());
         }
         try {
-            scheduler.scheduleDirect(new CountingRunnable(), -1, MINUTES);
-            fail();
-        } catch (IllegalArgumentException e) {
-            assertEquals("delay < 0: -1", e.getMessage());
-        }
-        try {
             scheduler.scheduleDirect(new CountingRunnable(), 1, null);
             fail();
         } catch (NullPointerException e) {
@@ -686,12 +718,6 @@ public final class HandlerSchedulerTest {
             fail();
         } catch (NullPointerException e) {
             assertEquals("run == null", e.getMessage());
-        }
-        try {
-            scheduler.schedulePeriodicallyDirect(new CountingRunnable(), -1, 1, MINUTES);
-            fail();
-        } catch (IllegalArgumentException e) {
-            assertEquals("delay < 0: -1", e.getMessage());
         }
         try {
             scheduler.schedulePeriodicallyDirect(new CountingRunnable(), 1, -1, MINUTES);
@@ -723,12 +749,6 @@ public final class HandlerSchedulerTest {
             assertEquals("run == null", e.getMessage());
         }
         try {
-            worker.schedule(new CountingRunnable(), -1, MINUTES);
-            fail();
-        } catch (IllegalArgumentException e) {
-            assertEquals("delay < 0: -1", e.getMessage());
-        }
-        try {
             worker.schedule(new CountingRunnable(), 1, null);
             fail();
         } catch (NullPointerException e) {
@@ -746,12 +766,6 @@ public final class HandlerSchedulerTest {
             assertEquals("run == null", e.getMessage());
         }
         try {
-            worker.schedulePeriodically(new CountingRunnable(), -1, 1, MINUTES);
-            fail();
-        } catch (IllegalArgumentException e) {
-            assertEquals("delay < 0: -1", e.getMessage());
-        }
-        try {
             worker.schedulePeriodically(new CountingRunnable(), 1, -1, MINUTES);
             fail();
         } catch (IllegalArgumentException e) {
@@ -763,6 +777,47 @@ public final class HandlerSchedulerTest {
         } catch (NullPointerException e) {
             assertEquals("unit == null", e.getMessage());
         }
+    }
+
+    @Test
+    public void directScheduleSetAsync() {
+        ShadowMessageQueue mainMessageQueue = shadowOf(Looper.getMainLooper().getQueue());
+
+        scheduler.scheduleDirect(new Runnable() {
+            @Override public void run() {
+            }
+        });
+
+        Message message = mainMessageQueue.getHead();
+        assertEquals(async, message.isAsynchronous());
+    }
+
+    @Test
+    public void workerScheduleSetAsync() {
+        ShadowMessageQueue mainMessageQueue = shadowOf(Looper.getMainLooper().getQueue());
+
+        Worker worker = scheduler.createWorker();
+        worker.schedule(new Runnable() {
+            @Override public void run() {
+            }
+        });
+
+        Message message = mainMessageQueue.getHead();
+        assertEquals(async, message.isAsynchronous());
+    }
+
+    @Test
+    public void workerSchedulePeriodicallySetAsync() {
+        ShadowMessageQueue mainMessageQueue = shadowOf(Looper.getMainLooper().getQueue());
+
+        Worker worker = scheduler.createWorker();
+        worker.schedulePeriodically(new Runnable() {
+            @Override public void run() {
+            }
+        }, 1, 1, MINUTES);
+
+        Message message = mainMessageQueue.getHead();
+        assertEquals(async, message.isAsynchronous());
     }
 
     private static void idleMainLooper(long amount, TimeUnit unit) {
